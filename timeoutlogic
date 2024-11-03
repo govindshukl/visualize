@@ -1,0 +1,37 @@
+from typing import Dict, Optional, List
+from pydantic import BaseModel
+from datetime import datetime, timedelta
+import base64
+import os
+
+class TimeoutConfig:
+    WARNING_TIME = timedelta(minutes=45)
+    TIMEOUT_TIME = timedelta(minutes=60)
+    CLEANUP_INTERVAL = 60
+
+class FileMetadata(BaseModel):
+    original_filename: str
+    file_unique_id: str
+    upload_timestamp: datetime
+    file_type: str
+    collection_name: Optional[str] = None
+    vectorstore_path: Optional[str] = None
+
+class ConversationTurn(BaseModel):
+    role: str
+    content: str
+
+class SessionActivity:
+    def __init__(self):
+        self.last_activity = datetime.utcnow()
+        self.warning_sent = False
+    
+    def update(self):
+        self.last_activity = datetime.utcnow()
+        self.warning_sent = False
+
+class SessionData:
+    def __init__(self):
+        self.encryption_key = base64.urlsafe_b64encode(os.urandom(32))
+        self.data: Dict[str, any] = {}
+        self.activity = SessionActivity()
