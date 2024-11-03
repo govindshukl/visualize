@@ -1,0 +1,92 @@
+class SessionManager:
+    def __init__(self):
+        self.sessions: Dict[str, SessionData] = {}
+        self.session_files: Dict[str, Dict[str, FileMetadata]] = {}
+        self.active_websockets: Dict[str, WebSocket] = {}
+        self.cleanup_task: Optional[asyncio.Task] = None
+    
+    async def start_cleanup_task(self):
+        if self.cleanup_task is None:
+            self.cleanup_task = asyncio.create_task(self._cleanup_idle_sessions())
+    
+    async def _cleanup_idle_sessions(self):
+        while True:
+            try:
+                current_time = datetime.utcnow()
+                sessions_to_remove = []
+                
+                for session_id, session in self.sessions.items():
+                    idle_duration = current_time - session.activity.last_activity
+                    
+                    if idle_duration >= TimeoutConfig.TIMEOUT_TIME:
+                        sessions_to_remove.append(session_id)
+                    elif idle_duration >= TimeoutConfig.WARNING_TIME and not session.activity.warning_sent:
+                        if websocket := self.active_websockets.get(session_id):
+                            try:
+                                remaining_mins = (TimeoutConfig.TIMEOUT_TIME - idle_duration).seconds // 60
+                                await websocket.send_json({
+                                    "type": "timeout_warning",
+                                    "message": f"Session will timeout in {remaining_mins} minutes due to inactivity"
+                                })
+                                session.activity.warning_sent = True
+                            except Exception as e:
+                                logger.error(f"Error sending warning: {e}")
+                                sessions_to_remove.append(session_id)
+                
+                for session_id in sessions_to_remove:
+                    await self.cleanup_session(session_id)
+                
+                await asyncio.sleep(TimeoutConfig.CLEANUP_INTERVAL)
+                
+            except Exception as e:
+                logger.error(f"Error in cleanup: {e}")
+                await asyncio.sleep(TimeoutConfig.CLEANUP_INTERVAL)
+    
+    async def cleanup_session(self, session_id: str):
+        try:
+            if websocket := self.active_websockets.get(session_id):
+                try:
+                    await websocket.send_json({
+                        "type": "session_timeout",
+                        "message": "Session has timed out due to inactivity"
+                    })
+                    await websocket.close(code=4000, reason="Session timeout")
+                except Exception as e:
+                    logger.error(f"Error closing websocket: {e}")
+            
+            if session_id in self.session_files:
+                for metadata in self.session_files[session_id].values():
+                    if metadata.vectorstore_path and os.path.exists(metadata.vectorstore_path):
+                        try:
+                            os.remove(metadata.vectorstore_path)
+                        except Exception as e:
+                            logger.error(f"Error cleaning up files: {e}")
+            
+            self.session_files.pop(session_id, None)
+            self.sessions.pop(session_id, None)
+            self.active_websockets.pop(session_id, None)
+            
+        except Exception as e:
+            logger.error(f"Error cleaning up session {session_id}: {e}")
+
+    def create_session(self) -> str:
+        session_id = str(uuid.uuid4())
+        self.sessions[session_id] = SessionData()
+        self.session_files[session_id] = {}
+        return session_id
+    
+    def update_activity(self, session_id: str):
+        if session := self.sessions.get(session_id):
+            session.activity.update()
+    
+    def get_session(self, session_id: str) -> Optional[SessionData]:
+        return self.sessions.get(session_id)
+    
+    def add_file(self, session_id: str, metadata: FileMetadata):
+        if session_id in self.session_files:
+            self.session_files[session_id][metadata.file_unique_id] = metadata
+            self.update_activity(session_id)
+    
+    def get_file(self, session_id: str, file_id: str) -> Optional[FileMetadata]:
+        self.update_activity(session_id)
+        return self.session_files.get(session_id, {}).get(file_id)
