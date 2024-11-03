@@ -1,0 +1,390 @@
+import tempfile
+import asyncio
+import os
+import shutil
+import uuid
+from datetime import datetime, timedelta
+from fastapi import FastAPI, APIRouter, HTTPException, WebSocket, File, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.docstore.document import Document
+from langchain_openai import AzureOpenAIEmbeddings
+from langchain_community.vectorstores import Chroma
+import json
+from langchain_community.document_loaders import PyPDFLoader
+from starlette.websockets import WebSocketDisconnect
+import docx2txt
+from typing import Dict, Optional
+import logging
+import weakref
+from contextlib import asynccontextmanager
+
+from skills import ask, execute_action, determine_intent, ConversationTurn, IntentResponse, generate_standalone_question
+
+# Configuration Classes
+class TimeoutConfig:
+    WARNING_TIME = timedelta(minutes=1)
+    TIMEOUT_TIME = timedelta(minutes=2)
+    CLEANUP_INTERVAL = 30
+
+class SessionActivity:
+    def __init__(self):
+        self.last_activity = datetime.utcnow()
+        self.warning_sent = False
+    
+    def update(self):
+        self.last_activity = datetime.utcnow()
+        self.warning_sent = False
+
+class SessionData:
+    def __init__(self):
+        self.data = {}
+        self.activity = SessionActivity()
+
+    def __getitem__(self, key):
+        return self.data[key]
+
+    def __setitem__(self, key, value):
+        self.data[key] = value
+
+    def get(self, key, default=None):
+        return self.data.get(key, default)
+    
+    def update_activity(self):
+        self.activity.update()
+
+# Setup logging
+def setup_logging():
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    return logging.getLogger(__name__)
+
+# Initialize FastAPI and globals
+app = FastAPI()
+router = APIRouter(tags=["Skill"])
+logger = setup_logging()
+active_connections = {}  # Changed to regular dictionary
+UPLOAD_DIR = "uploads"
+
+# CORS configuration
+origins = [
+    "http://localhost:8080",
+    "http://127.0.0.1:8080",
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Azure client setup
+def setup_azure_embedding_client():
+    return AzureOpenAIEmbeddings(
+        azure_deployment=os.getenv("AZURE_OPENAI_EMBEDDINGS_MODEL_NAME"),
+        openai_api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
+        api_key=os.getenv("AZURE_OPENAI_KEY")
+    )
+
+# Update the Session timeout checker
+async def check_session_timeouts():
+    while True:
+        try:
+            print(f"Checking for timed out sessions. Active sessions: {len(active_connections)}")
+            logger.info(f"Checking for timed out sessions. Active sessions: {len(active_connections)}")
+            current_time = datetime.utcnow()
+            sessions_to_remove = []
+            
+            # Debug log for active sessions
+            for session_id, session in active_connections.items():
+                logger.debug(f"Session {session_id} last activity: {session.activity.last_activity}")
+                idle_duration = current_time - session.activity.last_activity
+                
+                # Log the idle duration for debugging
+                logger.debug(f"Session {session_id} idle for {idle_duration.total_seconds()} seconds")
+                print(f"Session {session_id} idle for {idle_duration.total_seconds()} seconds")
+                
+                # Send warning
+                if idle_duration >= TimeoutConfig.WARNING_TIME and not session.activity.warning_sent:
+                    websocket = app.state.websockets.get(session_id)
+                    if websocket:
+                        try:
+                            remaining_mins = int((TimeoutConfig.TIMEOUT_TIME - idle_duration).total_seconds() / 60)
+                            logger.info(f"Sending warning to session {session_id}. {remaining_mins} minutes remaining")
+                            print(f"Sending warning to session {session_id}. {remaining_mins} minutes remaining")
+                            await websocket.send_json({
+                                "type": "timeout_warning",
+                                "message": f"Warning: Session will timeout in {remaining_mins} minutes due to inactivity",
+                                "remaining_minutes": remaining_mins
+                            })
+                            session.activity.warning_sent = True
+                            logger.info(f"Warning sent to session {session_id}")
+                            print(f"Warning sent to session {session_id}")
+                        except Exception as e:
+                            logger.error(f"Error sending warning to session {session_id}: {str(e)}")
+                            sessions_to_remove.append(session_id)
+                
+                # Check for timeout
+                if idle_duration >= TimeoutConfig.TIMEOUT_TIME:
+                    logger.info(f"Session {session_id} has timed out. Adding to cleanup list.")
+                    print(f"Session {session_id} has timed out. Adding to cleanup list.")
+                    sessions_to_remove.append(session_id)
+            
+            # Cleanup timed out sessions
+            for session_id in sessions_to_remove:
+                logger.info(f"Cleaning up session {session_id}")
+                websocket = app.state.websockets.get(session_id)
+                if websocket:
+                    try:
+                        await websocket.send_json({
+                            "type": "session_timeout",
+                            "message": "Session has timed out due to inactivity"
+                        })
+                        await websocket.close(code=4000, reason="Session timeout")
+                        logger.info(f"Successfully sent timeout message and closed websocket for session {session_id}")
+                        print(f"Successfully sent timeout message and closed websocket for session {session_id}")
+                    except Exception as e:
+                        logger.error(f"Error closing websocket for session {session_id}: {str(e)}")
+                
+                # Remove session from both dictionaries
+                active_connections.pop(session_id, None)
+                app.state.websockets.pop(session_id, None)
+                logger.info(f"Removed session {session_id} from active connections")
+            
+            # Log the current state
+            logger.info(f"Timeout check completed. Active sessions remaining: {len(active_connections)}")
+            
+            # Wait for next check
+            await asyncio.sleep(TimeoutConfig.CLEANUP_INTERVAL)
+            
+        except Exception as e:
+            logger.error(f"Error in timeout checker: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            await asyncio.sleep(TimeoutConfig.CLEANUP_INTERVAL)
+
+
+# Startup event
+cleanup_task = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    global logger, cleanup_task
+    logger = setup_logging()
+    print("Application startup")
+    logger.info("Application startup")
+    
+    # Initialize websockets storage
+    app.state.websockets = {}
+    
+    # Create required directories
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    os.makedirs("chroma_db", exist_ok=True)
+    
+    # Start the background task
+    cleanup_task = asyncio.create_task(check_session_timeouts())
+    logger.info("Timeout checker task started")
+    
+    try:
+        yield  # This is where FastAPI runs
+    finally:
+        # Shutdown
+        if cleanup_task:
+            cleanup_task.cancel()
+            try:
+                await cleanup_task
+            except asyncio.CancelledError:
+                pass
+            logger.info("Timeout checker task cancelled")
+
+app = FastAPI(lifespan=lifespan)
+
+
+# File upload endpoint
+@router.post("/upload")
+async def upload_pdf(file: UploadFile = File(...)):
+    if not file.filename.endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="Only PDF files are allowed")
+
+    if not os.path.exists(UPLOAD_DIR):
+        os.makedirs(UPLOAD_DIR)
+    
+    file_path = os.path.join(UPLOAD_DIR, file.filename)
+    try:
+        with open(file_path, "wb") as buffer:
+            content = await file.read()
+            buffer.write(content)
+        
+        loader = PyPDFLoader(file_path)
+        pages = loader.load_and_split()
+        
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        chunks = text_splitter.split_documents(pages)
+        
+        embedding_function = setup_azure_embedding_client()
+        unique_id = str(uuid.uuid4())
+        vectorstore = Chroma(
+            persist_directory=f"chroma_db/{unique_id}",
+            embedding_function=embedding_function,
+            collection_name=f"{unique_id}"
+        )
+        
+        vectorstore.add_documents(chunks)
+        vectorstore.persist()
+        
+        return {
+            "filename": f"{file.filename}",
+            "file_unique_id": f"{unique_id}",
+            "status": "success",
+            "message": f"Successfully uploaded and processed {len(chunks)} chunks into ChromaDB"
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"An error occurred while processing the file: {str(e)}")
+    finally:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
+# Config loading functions
+def load_config():
+    with open('persona_skills_config.json', 'r') as config_file:
+        return json.load(config_file)
+
+def get_action_and_prompt(persona_name, skill_name, intent_name):
+    config = load_config()
+    for persona in config['personas']:
+        if persona['name'] == persona_name:
+            for skill in persona['skills']:
+                if skill['name'] == skill_name:
+                    for intent in skill['intents']:
+                        if intent['name'] == intent_name:
+                            return intent['action'], intent['system_prompt']
+    return None, None
+
+# WebSocket endpoint
+@router.websocket("/workforce/ai/live-chat")
+async def stream(websocket: WebSocket):
+    await websocket.accept()
+    session_id = str(uuid.uuid4())
+    session_data = SessionData()
+    
+    # Store session data
+    active_connections[session_id] = session_data
+    app.state.websockets[session_id] = websocket
+    
+    logger.info(f"WebSocket connection established for session {session_id}")
+    
+    # Send initial session information
+    await websocket.send_json({
+        "type": "session_init",
+        "session_id": session_id,
+        "timeout_config": {
+            "warning_time_minutes": TimeoutConfig.WARNING_TIME.total_seconds() / 60,
+            "timeout_time_minutes": TimeoutConfig.TIMEOUT_TIME.total_seconds() / 60
+        }
+    })
+    
+    background_tasks = set()
+    try:
+        while True:
+            try:
+                request = await websocket.receive_json()
+                # Update activity timestamp
+                session_data.update_activity()
+                logger.debug(f"Activity updated for session {session_id}")
+                
+                logger.info(f"Received request: {request}")
+                task = asyncio.create_task(compute_genai_response(request, websocket))
+                background_tasks.add(task)
+                task.add_done_callback(background_tasks.discard)
+            except WebSocketDisconnect:
+                logger.info(f"WebSocket disconnected for session {session_id}")
+                break
+    except Exception as e:
+        logger.exception(e)
+    finally:
+        # Cleanup
+        active_connections.pop(session_id, None)
+        app.state.websockets.pop(session_id, None)
+        for task in background_tasks:
+            task.cancel()
+        try:
+            await websocket.close()
+        except RuntimeError:
+            pass
+        logger.info(f"WebSocket closed for session {session_id}")
+
+# Request processing
+async def compute_genai_response(request, websocket):
+    try:
+        # Get session and update activity
+        session_id = next(
+            sid for sid, ws in app.state.websockets.items() 
+            if ws == websocket
+        )
+        session = active_connections.get(session_id)
+        if session:
+            session.update_activity()
+
+        req_id = request["id"]
+        user_input = request['question']
+        conversation_history = [ConversationTurn(**turn) for turn in request['conversation_history']]
+        custom_instruction = request.get('custom_instruction')
+        logger.info(f"Conversation history: {conversation_history}")
+        persona = request['digital_persona']
+        skill = request['skill']
+        intent = request.get('intent')
+        speech_mode = request.get('speech_mode')
+        input_file_unique_id = request.get('input_file_unique_id')
+        output_file_unique_id = request.get('output_file_unique_id')
+        image_base64 = request.get('image_base64')
+        
+        logger.info(f"/stream request user_input len {len(user_input)}")
+        logger.info(f"user input question is {user_input}")
+        logger.info(f"the intent is {intent}")
+        
+        intent_response = await determine_intent(persona, skill, user_input, conversation_history)
+        logger.info(f"Intent response: {intent_response}")
+        intent = intent_response.intent
+        standalone_question = intent_response.standalone_question
+        
+        logger.info(f"Intent: {intent}, Standalone question: {standalone_question}")
+        
+        action, prompt = get_action_and_prompt(persona, skill, intent)
+        
+        if action is None or prompt is None:
+            raise ValueError(f"No action or prompt found for persona: {persona}, skill: {skill}, intent: {intent}")
+        
+        await websocket.send_json({
+            "id": req_id,
+            "chunk": "Thinking....",
+            "end": False
+        })
+
+        await execute_action(
+            persona, skill, action, prompt, standalone_question, 
+            conversation_history, websocket, input_file_unique_id, 
+            output_file_unique_id, image_base64, speech_mode, custom_instruction
+        )
+        
+    except Exception as e:
+        logger.exception(f"An error occurred: {str(e)}")
+        await websocket.send_json({
+            "id": req_id,
+            "error": str(e),
+            "end": True
+        })
+
+# Ping endpoint for health check
+@router.get("/ping")
+async def ping():
+    return {"message": "pong"}
+
+# Include router in app
+app.include_router(router)
+
