@@ -1,0 +1,156 @@
+from chromadb import PersistentClient
+import shutil
+import os
+import logging
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def get_chroma_client(persist_directory: str):
+    """
+    Context manager for ChromaDB client to ensure proper connection handling.
+    """
+    client = None
+    try:
+        client = PersistentClient(path=persist_directory)
+        yield client
+    finally:
+        if client:
+            try:
+                # Reset the client
+                client.reset()
+                # Close any outstanding connections
+                del client
+            except Exception as e:
+                logging.error(f"Error closing ChromaDB client: {str(e)}")
+
+async def purge_chroma_collections(persist_directory: str) -> dict:
+    """
+    Purges all collections and their data from the specified ChromaDB persist directory
+    with proper connection handling.
+    
+    Args:
+        persist_directory (str): Path to the ChromaDB persist directory
+    
+    Returns:
+        dict: Status report of the purge operation
+    """
+    logger = logging.getLogger(__name__)
+    
+    if not os.path.exists(persist_directory):
+        logger.warning(f"Persist directory {persist_directory} does not exist")
+        return {
+            "status": "warning",
+            "message": f"Directory {persist_directory} does not exist",
+            "collections_removed": 0
+        }
+    
+    try:
+        deleted_collections = []
+        collection_count = 0
+        
+        # Use context manager for client handling
+        async with get_chroma_client(persist_directory) as client:
+            # Get all collections
+            collections = client.list_collections()
+            collection_count = len(collections)
+            
+            logger.info(f"Found {collection_count} collections in {persist_directory}")
+            
+            # Delete each collection
+            for collection in collections:
+                try:
+                    collection_name = collection.name
+                    logger.info(f"Deleting collection: {collection_name}")
+                    client.delete_collection(name=collection_name)
+                    deleted_collections.append(collection_name)
+                    logger.info(f"Successfully deleted collection: {collection_name}")
+                except Exception as e:
+                    logger.error(f"Error deleting collection {collection_name}: {str(e)}")
+
+        # Remove the persist directory completely after client is closed
+        try:
+            shutil.rmtree(persist_directory)
+            logger.info(f"Removed persist directory: {persist_directory}")
+        except Exception as e:
+            logger.error(f"Error removing directory {persist_directory}: {str(e)}")
+        
+        # Recreate empty directory
+        os.makedirs(persist_directory, exist_ok=True)
+        
+        return {
+            "status": "success",
+            "message": "Successfully purged all collections",
+            "collections_removed": collection_count,
+            "deleted_collections": deleted_collections,
+            "directory": persist_directory
+        }
+        
+    except Exception as e:
+        logger.error(f"Error during purge operation: {str(e)}")
+        return {
+            "status": "error",
+            "message": f"Error during purge: {str(e)}",
+            "collections_removed": 0,
+            "directory": persist_directory
+        }
+
+async def purge_all_user_collections():
+    """
+    Purges all user collections in your application.
+    Assumes collections are stored in chroma_db/{unique_id} structure.
+    """
+    base_dir = "chroma_db"
+    results = []
+    
+    if not os.path.exists(base_dir):
+        return {
+            "status": "warning",
+            "message": f"Base directory {base_dir} does not exist",
+            "results": []
+        }
+    
+    # Get all subdirectories in the chroma_db directory
+    collection_dirs = [
+        os.path.join(base_dir, d) for d in os.listdir(base_dir) 
+        if os.path.isdir(os.path.join(base_dir, d))
+    ]
+    
+    # Purge each collection directory
+    for dir_path in collection_dirs:
+        result = await purge_chroma_collections(dir_path)
+        results.append({
+            "directory": dir_path,
+            "result": result
+        })
+    
+    return {
+        "status": "complete",
+        "total_directories_processed": len(results),
+        "results": results
+    }
+
+# FastAPI endpoint
+@router.post("/purge-collections")
+async def purge_collections():
+    """
+    API endpoint to purge all ChromaDB collections with proper connection handling.
+    """
+    try:
+        result = await purge_all_user_collections()
+        return result
+    except Exception as e:
+        logger.error(f"Error in purge collections endpoint: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error purging collections: {str(e)}"
+        )
+
+# Example usage:
+async def example_usage():
+    # Purge a specific directory
+    single_result = await purge_chroma_collections("chroma_db/your_collection_id")
+    print("Single directory purge result:", single_result)
+    
+    # Purge all collections
+    all_results = await purge_all_user_collections()
+    print("All collections purge result:", all_results)
