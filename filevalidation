@@ -1,123 +1,137 @@
-import React, { useState } from 'react';
-import { Alert, AlertDescription } from '@/components/ui/alert';
-import { Upload } from 'lucide-react';
+const RoleSelector = ({ onClose }: RoleSelectorProps) => {
+  const [file, setFile] = React.useState<File | null>(null);
+  const [uploadMessage, setUploadMessage] = React.useState<string>('');
+  const [isUploading, setIsUploading] = React.useState<boolean>(false);
 
-const FileUpload = () => {
-  const [error, setError] = useState('');
-  const [selectedFile, setSelectedFile] = useState(null);
-
-  // Define size limits for different file types (in bytes)
-  const FILE_SIZE_LIMITS = {
-    'image/jpeg': 5 * 1024 * 1024,    // 5MB for JPEG images
-    'image/png': 5 * 1024 * 1024,     // 5MB for PNG images
-    'application/pdf': 10 * 1024 * 1024, // 10MB for PDFs
-    'text/csv': 2 * 1024 * 1024,      // 2MB for CSV files
-    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 5 * 1024 * 1024, // 5MB for Excel files
-    // Add more file types as needed
+  // Define allowed file types and their size limits
+  const FILE_TYPES = {
+    'image/jpeg': { maxSize: 5 * 1024 * 1024, label: 'JPEG' },    // 5MB
+    'image/png': { maxSize: 5 * 1024 * 1024, label: 'PNG' },      // 5MB
+    'application/pdf': { maxSize: 10 * 1024 * 1024, label: 'PDF' },// 10MB
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document': { 
+      maxSize: 10 * 1024 * 1024, 
+      label: 'DOCX' 
+    } // 10MB for DOCX
   };
 
-  const validateFile = (file) => {
+  const validateFile = (file: File): string | null => {
     // Check if file type is supported
-    if (!FILE_SIZE_LIMITS.hasOwnProperty(file.type)) {
-      return `File type ${file.type || 'unknown'} is not supported`;
+    if (!FILE_TYPES.hasOwnProperty(file.type)) {
+      return `File type not supported. Please upload only images (JPG/PNG), PDF, or DOCX files.`;
     }
 
     // Check file size
-    if (file.size > FILE_SIZE_LIMITS[file.type]) {
-      const maxSizeMB = FILE_SIZE_LIMITS[file.type] / (1024 * 1024);
-      return `File size exceeds ${maxSizeMB}MB limit for ${file.type} files`;
+    const maxSize = FILE_TYPES[file.type as keyof typeof FILE_TYPES].maxSize;
+    if (file.size > maxSize) {
+      const maxSizeMB = maxSize / (1024 * 1024);
+      return `File size exceeds ${maxSizeMB}MB limit for ${FILE_TYPES[file.type as keyof typeof FILE_TYPES].label} files`;
     }
 
     return null;
   };
 
-  const handleFileChange = (event) => {
-    const file = event.target.files[0];
-    if (!file) return;
-
-    const validationError = validateFile(file);
-    if (validationError) {
-      setError(validationError);
-      setSelectedFile(null);
-      event.target.value = ''; // Reset input
-      return;
-    }
-
-    setError('');
-    setSelectedFile(file);
-  };
-
-  const handleUpload = async () => {
-    if (!selectedFile) return;
-
-    // Create FormData object
-    const formData = new FormData();
-    formData.append('file', selectedFile);
-
-    try {
-      // Replace with your API endpoint
-      const response = await fetch('/api/upload', {
-        method: 'POST',
-        body: formData,
-      });
-
-      if (!response.ok) {
-        throw new Error('Upload failed');
+  const handleFileChange = (
+    event: React.ChangeEvent<HTMLInputElement>
+  ) => {
+    if (event.target.files) {
+      const selectedFile = event.target.files[0];
+      
+      // Validate file
+      const validationError = validateFile(selectedFile);
+      if (validationError) {
+        setUploadMessage(validationError);
+        setFile(null);
+        event.target.value = ''; // Reset input
+        return;
       }
 
-      // Handle successful upload
-      setSelectedFile(null);
-      // Reset file input
-      const fileInput = document.querySelector('input[type="file"]');
-      if (fileInput) fileInput.value = '';
-    } catch (err) {
-      setError('Failed to upload file. Please try again.');
+      setFile(selectedFile);
+      console.log(`File selected: ${selectedFile.name}`);
+      setUploadMessage(''); // Clear any previous error messages
+    }
+  };
+
+  const uploadFile = async (file: File, endpoint: string) => {
+    const formData = new FormData();
+    formData.append('file', file);
+    
+    console.log(`Client id is: ${client_id}`);
+    endpoint = endpoint + "/" + client_id;
+    
+    try {
+      setIsUploading(true); // Set the uploading state to true
+      setUploadMessage(null); // Clear any previous upload message
+      
+      const response = await axios.post(endpoint, formData, {
+        headers: {
+          'Content-Type': 'multipart/form-data'
+        }
+      });
+      
+      console.log(`File ${response.data.filename}, ${response.data.message}`);
+      updateKBFileUniqueId(response.data.file_unique_id);
+      updateKBFileName1(response.data.filename);
+      setUploadMessage(`File uploaded: ${response.data.filename}, Message: ${response.data.message}`);
+      
+    } catch (error) {
+      console.error('Error uploading file:', error);
+      setUploadMessage('Error uploading file. Please try again.');
+    } finally {
+      setIsUploading(false); // Set the uploading state back to false
     }
   };
 
   return (
-    <div className="w-full max-w-md p-6 space-y-4">
-      <div className="flex items-center justify-center w-full">
-        <label className="flex flex-col items-center justify-center w-full h-64 border-2 border-dashed rounded-lg cursor-pointer bg-gray-50 hover:bg-gray-100">
-          <div className="flex flex-col items-center justify-center pt-5 pb-6">
-            <Upload className="w-10 h-10 mb-3 text-gray-400" />
-            <p className="mb-2 text-sm text-gray-500">
-              <span className="font-semibold">Click to upload</span> or drag and drop
-            </p>
-            <p className="text-xs text-gray-500">
-              Supported formats: JPEG, PNG, PDF, CSV, XLSX
-            </p>
+    <>
+      {/* @ts-ignore */}
+      <Modal 
+        title="Upload Knowledge Base File"
+        className="max-w-2xl"
+      >
+        <div className="space-y-4">
+          <div className="flex items-center justify-center w-full">
+            <label className="flex flex-col items-center justify-center w-full h-64 border-2 border-dashed rounded-lg cursor-pointer bg-gray-50 hover:bg-gray-100">
+              <div className="flex flex-col items-center justify-center pt-5 pb-6">
+                <p className="mb-2 text-sm text-gray-500">
+                  <span className="font-semibold">Click to upload</span> or drag and drop
+                </p>
+                <p className="text-xs text-gray-500">
+                  Supported formats: JPG, PNG, PDF, DOCX (Max size: 5-10MB)
+                </p>
+              </div>
+              <input
+                type="file"
+                className="hidden"
+                onChange={handleFileChange}
+                accept=".jpg,.jpeg,.png,.pdf,.docx"
+              />
+            </label>
           </div>
-          <input
-            type="file"
-            className="hidden"
-            onChange={handleFileChange}
-            accept=".jpg,.jpeg,.png,.pdf,.csv,.xlsx"
-          />
-        </label>
-      </div>
 
-      {error && (
-        <Alert variant="destructive">
-          <AlertDescription>{error}</AlertDescription>
-        </Alert>
-      )}
+          {uploadMessage && (
+            <div className={`p-4 rounded-lg ${uploadMessage.includes('Error') ? 'bg-red-100 text-red-700' : 'bg-green-100 text-green-700'}`}>
+              {uploadMessage}
+            </div>
+          )}
 
-      {selectedFile && (
-        <div className="flex items-center justify-between p-4 bg-gray-50 rounded-lg">
-          <span className="text-sm text-gray-500">
-            {selectedFile.name} ({(selectedFile.size / 1024 / 1024).toFixed(2)}MB)
-          </span>
-          <button
-            onClick={handleUpload}
-            className="px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700"
-          >
-            Upload
-          </button>
+          {file && !uploadMessage && (
+            <div className="flex items-center justify-between p-4 bg-gray-50 rounded-lg">
+              <span className="text-sm text-gray-500">
+                {file.name} ({(file.size / 1024 / 1024).toFixed(2)}MB)
+              </span>
+              <button
+                onClick={() => uploadFile(file, endpoint)}
+                disabled={isUploading}
+                className={`px-4 py-2 text-sm font-medium text-white rounded-lg ${
+                  isUploading ? 'bg-gray-400' : 'bg-blue-600 hover:bg-blue-700'
+                }`}
+              >
+                {isUploading ? 'Uploading...' : 'Upload'}
+              </button>
+            </div>
+          )}
         </div>
-      )}
-    </div>
+      </Modal>
+    </>
   );
 };
-
-export default FileUpload;
