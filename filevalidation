@@ -1,0 +1,123 @@
+import React, { useState } from 'react';
+import { Alert, AlertDescription } from '@/components/ui/alert';
+import { Upload } from 'lucide-react';
+
+const FileUpload = () => {
+  const [error, setError] = useState('');
+  const [selectedFile, setSelectedFile] = useState(null);
+
+  // Define size limits for different file types (in bytes)
+  const FILE_SIZE_LIMITS = {
+    'image/jpeg': 5 * 1024 * 1024,    // 5MB for JPEG images
+    'image/png': 5 * 1024 * 1024,     // 5MB for PNG images
+    'application/pdf': 10 * 1024 * 1024, // 10MB for PDFs
+    'text/csv': 2 * 1024 * 1024,      // 2MB for CSV files
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 5 * 1024 * 1024, // 5MB for Excel files
+    // Add more file types as needed
+  };
+
+  const validateFile = (file) => {
+    // Check if file type is supported
+    if (!FILE_SIZE_LIMITS.hasOwnProperty(file.type)) {
+      return `File type ${file.type || 'unknown'} is not supported`;
+    }
+
+    // Check file size
+    if (file.size > FILE_SIZE_LIMITS[file.type]) {
+      const maxSizeMB = FILE_SIZE_LIMITS[file.type] / (1024 * 1024);
+      return `File size exceeds ${maxSizeMB}MB limit for ${file.type} files`;
+    }
+
+    return null;
+  };
+
+  const handleFileChange = (event) => {
+    const file = event.target.files[0];
+    if (!file) return;
+
+    const validationError = validateFile(file);
+    if (validationError) {
+      setError(validationError);
+      setSelectedFile(null);
+      event.target.value = ''; // Reset input
+      return;
+    }
+
+    setError('');
+    setSelectedFile(file);
+  };
+
+  const handleUpload = async () => {
+    if (!selectedFile) return;
+
+    // Create FormData object
+    const formData = new FormData();
+    formData.append('file', selectedFile);
+
+    try {
+      // Replace with your API endpoint
+      const response = await fetch('/api/upload', {
+        method: 'POST',
+        body: formData,
+      });
+
+      if (!response.ok) {
+        throw new Error('Upload failed');
+      }
+
+      // Handle successful upload
+      setSelectedFile(null);
+      // Reset file input
+      const fileInput = document.querySelector('input[type="file"]');
+      if (fileInput) fileInput.value = '';
+    } catch (err) {
+      setError('Failed to upload file. Please try again.');
+    }
+  };
+
+  return (
+    <div className="w-full max-w-md p-6 space-y-4">
+      <div className="flex items-center justify-center w-full">
+        <label className="flex flex-col items-center justify-center w-full h-64 border-2 border-dashed rounded-lg cursor-pointer bg-gray-50 hover:bg-gray-100">
+          <div className="flex flex-col items-center justify-center pt-5 pb-6">
+            <Upload className="w-10 h-10 mb-3 text-gray-400" />
+            <p className="mb-2 text-sm text-gray-500">
+              <span className="font-semibold">Click to upload</span> or drag and drop
+            </p>
+            <p className="text-xs text-gray-500">
+              Supported formats: JPEG, PNG, PDF, CSV, XLSX
+            </p>
+          </div>
+          <input
+            type="file"
+            className="hidden"
+            onChange={handleFileChange}
+            accept=".jpg,.jpeg,.png,.pdf,.csv,.xlsx"
+          />
+        </label>
+      </div>
+
+      {error && (
+        <Alert variant="destructive">
+          <AlertDescription>{error}</AlertDescription>
+        </Alert>
+      )}
+
+      {selectedFile && (
+        <div className="flex items-center justify-between p-4 bg-gray-50 rounded-lg">
+          <span className="text-sm text-gray-500">
+            {selectedFile.name} ({(selectedFile.size / 1024 / 1024).toFixed(2)}MB)
+          </span>
+          <button
+            onClick={handleUpload}
+            className="px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700"
+          >
+            Upload
+          </button>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default FileUpload;
