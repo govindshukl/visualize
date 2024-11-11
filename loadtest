@@ -30,11 +30,16 @@ SAMPLE_QUESTIONS = [
 ]
 
 class WebSocketLoadTester:
-    def __init__(self, websocket_url, upload_base_url, file_path, num_sessions=10):
+    def __init__(self, websocket_url, upload_base_url, file_path, 
+                 num_sessions=10, messages_per_session=50,
+                 min_delay=1, max_delay=3):
         self.websocket_url = websocket_url
         self.upload_base_url = upload_base_url
         self.file_path = file_path
         self.num_sessions = num_sessions
+        self.messages_per_session = messages_per_session
+        self.min_delay = min_delay
+        self.max_delay = max_delay
         self.active_sessions = {}
         self.stats = {
             'total_messages_sent': 0,
@@ -42,7 +47,8 @@ class WebSocketLoadTester:
             'failed_connections': 0,
             'successful_uploads': 0,
             'failed_uploads': 0,
-            'active_connections': 0
+            'active_connections': 0,
+            'completed_sessions': 0
         }
 
     async def upload_file(self, client_id, session_id):
@@ -102,6 +108,8 @@ class WebSocketLoadTester:
 
     async def handle_session(self, session_id):
         """Handle individual websocket session"""
+        messages_sent = 0
+        
         try:
             async with websockets.connect(self.websocket_url) as websocket:
                 self.active_sessions[session_id] = websocket
@@ -120,13 +128,19 @@ class WebSocketLoadTester:
                     file_unique_id = await self.upload_file(client_id, session_id)
                     
                     # Main message loop
-                    while True:
+                    while messages_sent < self.messages_per_session:
                         await self.send_message(websocket, session_id, file_unique_id)
                         response = await websocket.recv()
                         self.stats['total_messages_received'] += 1
+                        messages_sent += 1
+                        
+                        logging.info(f"Session {session_id}: Progress - {messages_sent}/{self.messages_per_session} messages")
                         
                         # Add delay between messages
-                        await asyncio.sleep(random.uniform(1, 3))
+                        await asyncio.sleep(random.uniform(self.min_delay, self.max_delay))
+                    
+                    self.stats['completed_sessions'] += 1
+                    logging.info(f"Session {session_id}: Completed all {self.messages_per_session} messages")
                 
         except Exception as e:
             self.stats['failed_connections'] += 1
@@ -138,7 +152,8 @@ class WebSocketLoadTester:
 
     async def start_load_test(self):
         """Start the load test with multiple sessions"""
-        logging.info(f"Starting load test with {self.num_sessions} sessions")
+        logging.info(f"Starting load test with {self.num_sessions} sessions, "
+                    f"{self.messages_per_session} messages per session")
         tasks = []
         
         for i in range(self.num_sessions):
@@ -167,25 +182,30 @@ class WebSocketLoadTester:
         logging.info(f"Successful File Uploads: {self.stats['successful_uploads']}")
         logging.info(f"Failed File Uploads: {self.stats['failed_uploads']}")
         logging.info(f"Failed Connections: {self.stats['failed_connections']}")
+        logging.info(f"Completed Sessions: {self.stats['completed_sessions']}/{self.num_sessions}")
+        
+        avg_messages = self.stats['total_messages_sent'] / max(self.num_sessions, 1)
+        logging.info(f"Average Messages per Session: {avg_messages:.2f}")
 
 async def main():
     # Configuration
-    websocket_url = "ws://localhost:8000/ws"
-    upload_base_url = "http://localhost:8000"
-    file_path = "path/to/your/Resume.pdf"  # Replace with actual file path
+    config = {
+        'websocket_url': "ws://localhost:8000/ws",
+        'upload_base_url': "http://localhost:8000",
+        'file_path': "path/to/your/Resume.pdf",  # Replace with actual file path
+        'num_sessions': 10,
+        'messages_per_session': 50,  # Number of messages to send per session
+        'min_delay': 1,  # Minimum delay between messages in seconds
+        'max_delay': 3   # Maximum delay between messages in seconds
+    }
     
     # Verify file exists
-    if not Path(file_path).is_file():
-        logging.error(f"File not found: {file_path}")
+    if not Path(config['file_path']).is_file():
+        logging.error(f"File not found: {config['file_path']}")
         return
     
     # Create and start load tester
-    load_tester = WebSocketLoadTester(
-        websocket_url=websocket_url,
-        upload_base_url=upload_base_url,
-        file_path=file_path,
-        num_sessions=10
-    )
+    load_tester = WebSocketLoadTester(**config)
     await load_tester.start_load_test()
 
 if __name__ == "__main__":
